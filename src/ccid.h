@@ -150,6 +150,10 @@ typedef struct
 	// Lock for array of bStatus
 	pthread_mutex_t bStatusLock;
 	pthread_mutex_t *pbStatusLock;
+
+	/* True if the last slot was opened. */
+	int lastSlotOpened;
+	int *pLastSlotOpened;
 #endif
 
 	// Firmware fix enabled
@@ -219,6 +223,7 @@ typedef struct
 #define GEMALTO_EZIO_CBP 0x08E634C3
 #define CARDMAN3121	0x076B3021
 #define LTC31		0x07830003
+#define C3PO_LTC31_v2 0x07830006
 #define SCR331DI	0x04E65111
 #define SCR331DINTTCOM	0x04E65120
 #define SDI010		0x04E65121

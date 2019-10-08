@@ -1,7 +1,7 @@
 /*
     ccid.c: CCID common code
     Copyright (C) 2003-2010   Ludovic Rousseau
-    Copyright (C) 2009-2016   Advanced Card Systems Ltd.
+    Copyright (C) 2009-2018   Advanced Card Systems Ltd.
 
     This library is free software; you can redistribute it and/or
     modify it under the terms of the GNU Lesser General Public
@@ -496,6 +496,8 @@ int ccid_open_hack_post(unsigned int reader_index)
 			 * The problem is that the PIN code entered using the Secure
 			 * Pin Entry function is also sent to the host.
 			 */
+
+		case C3PO_LTC31_v2:
 			ccid_descriptor->bPINSupport = 0;
 			break;
 
@@ -821,6 +823,31 @@ int ccid_open_hack_post(unsigned int reader_index)
 			{
 				ccid_descriptor->dwFeatures = 0x000204BA;	// MCU
 				ccid_descriptor->dwMaxDataRate = 344100;
+
+				/* ACR1281U-C1 >= v526 supports ICC extended APDU. */
+				if (ccid_descriptor->readerID == ACS_ACR1281_1S_DUAL_READER)
+				{
+					char firmwareVersion[30];
+					unsigned int firmwareVersionLen = sizeof(firmwareVersion);
+
+					DEBUG_INFO1("Getting ACR1281U-C1 firmware version...");
+					if (ACR1222_GetFirmwareVersion(reader_index,
+						firmwareVersion, &firmwareVersionLen))
+					{
+						int version = 0;
+
+						DEBUG_INFO2("ACR1281U-C1 firmware version: %s",
+							firmwareVersion);
+						if (sscanf(firmwareVersion, "ACR1281U_V%d", &version)
+							> 0)
+						{
+							if (version >= 526)
+							{
+								ccid_descriptor->dwFeatures = 0x000404BA;
+							}
+						}
+					}
+				}
 			}
 			else if (ccid_descriptor->bCurrentSlotIndex == 1)
 			{

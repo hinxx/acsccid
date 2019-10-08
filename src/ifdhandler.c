@@ -1,7 +1,7 @@
 /*
     ifdhandler.c: IFDH API
     Copyright (C) 2003-2010   Ludovic Rousseau
-    Copyright (C) 2009-2017   Advanced Card Systems Ltd.
+    Copyright (C) 2009-2019   Advanced Card Systems Ltd.
 
     This library is free software; you can redistribute it and/or
     modify it under the terms of the GNU Lesser General Public
@@ -118,7 +118,6 @@ DWORD ACR38CardType = 0;
 
 /* local functions */
 static void init_driver(void);
-static void extra_egt(ATR_t *atr, _ccid_descriptor *ccid_desc, DWORD Protocol);
 static char find_baud_rate(unsigned int baudrate, unsigned int *list);
 static unsigned int T0_card_timeout(double f, double d, int TC1, int TC2,
 	int clock_frequency);
@@ -344,6 +343,14 @@ error:
 		DEBUG_INFO2("bNumEndpoints: %d", ccid_descriptor->bNumEndpoints);
 		DEBUG_INFO2("bVoltageSupport: 0x%02X", ccid_descriptor->bVoltageSupport);
 	}
+
+#ifdef __APPLE__
+	if (ccid_descriptor->bCurrentSlotIndex == ccid_descriptor->bMaxSlotIndex)
+	{
+		/* Last slot was opened. */
+		*(ccid_descriptor->pLastSlotOpened) = TRUE;
+	}
+#endif
 
 	return return_value;
 } /* CreateChannelByNameOrChannel */
@@ -673,6 +680,15 @@ EXTERNAL RESPONSECODE IFDHGetCapabilities(DWORD Lun, DWORD Tag,
 
 				ccid_desc = get_ccid_descriptor(reader_index);
 
+				/* Disable polling thread for APG8201 series. */
+				if ((ccid_desc->readerID == ACS_APG8201)
+					|| (ccid_desc->readerID == ACS_APG8201_B2)
+					|| (ccid_desc->readerID == ACS_APG8201Z)
+					|| (ccid_desc->readerID == ACS_APG8201Z2))
+				{
+					break;
+				}
+
 				/* CCID and not ICCD */
 				if (((PROTOCOL_CCID == ccid_desc -> bInterfaceProtocol)
 					|| (PROTOCOL_ACR38 == ccid_desc -> bInterfaceProtocol))
@@ -720,6 +736,16 @@ EXTERNAL RESPONSECODE IFDHGetCapabilities(DWORD Lun, DWORD Tag,
 				*Length = 0;
 
 				ccid_desc = get_ccid_descriptor(reader_index);
+
+				/* Disable polling thread for APG8201 series. */
+				if ((ccid_desc->readerID == ACS_APG8201)
+					|| (ccid_desc->readerID == ACS_APG8201_B2)
+					|| (ccid_desc->readerID == ACS_APG8201Z)
+					|| (ccid_desc->readerID == ACS_APG8201Z2))
+				{
+					break;
+				}
+
 				/* CCID and not ICCD */
 				if (((PROTOCOL_CCID == ccid_desc -> bInterfaceProtocol)
 					|| (PROTOCOL_ACR38 == ccid_desc -> bInterfaceProtocol))
@@ -866,9 +892,6 @@ EXTERNAL RESPONSECODE IFDHSetProtocolParameters(DWORD Lun, DWORD Protocol,
 		ccid_slot->nATRLength);
 	if (ATR_MALFORMED == atr_ret)
 		return IFD_PROTOCOL_NOT_SUPPORTED;
-
-	/* Apply Extra EGT patch for bogus cards */
-	extra_egt(&atr, ccid_desc, Protocol);
 
 	if (SCARD_PROTOCOL_T0 == Protocol)
 		pps[1] |= ATR_PROTOCOL_TYPE_T0;
@@ -1486,7 +1509,8 @@ EXTERNAL RESPONSECODE IFDHPowerICC(DWORD Lun, DWORD Action,
 			if ((return_value != IFD_SUCCESS) || (nlength == 0))	// ACR1222: No ATR is returned
 			{
 				/* used by GemCore SIM PRO: no card is present */
-				if (GEMCORESIMPRO == ccid_descriptor -> readerID)
+				if ((ccid_descriptor->isSamSlot)
+					|| (GEMCORESIMPRO == ccid_descriptor -> readerID))
 					get_ccid_descriptor(reader_index)->dwSlotStatus
 						= IFD_ICC_NOT_PRESENT;
 
@@ -1920,7 +1944,7 @@ EXTERNAL RESPONSECODE IFDHControl(DWORD Lun, DWORD dwControlCode,
 		PCSC_TLV_STRUCTURE *pcsc_tlv = (PCSC_TLV_STRUCTURE *)RxBuffer;
 		int readerID = ccid_descriptor -> readerID;
 
-		/* we need room for up to five records */
+		/* we need room for up to ten records */
 		if (RxLength < 10 * sizeof(PCSC_TLV_STRUCTURE))
 			return IFD_ERROR_INSUFFICIENT_BUFFER;
 
@@ -2357,6 +2381,7 @@ EXTERNAL RESPONSECODE IFDHControl(DWORD Lun, DWORD dwControlCode,
 		/* ACR83, APG8201 and APG8201Z */
 		if ((ACS_ACR83U == ccid_descriptor -> readerID)
 			|| (ACS_APG8201 == ccid_descriptor -> readerID)
+			|| (ACS_APG8201_B2 == ccid_descriptor -> readerID)
 			|| (ACS_APG8201Z == ccid_descriptor -> readerID)
 			|| (ACS_APG8201Z2 == ccid_descriptor -> readerID))
 		{
@@ -2625,6 +2650,51 @@ EXTERNAL RESPONSECODE IFDHControl(DWORD Lun, DWORD dwControlCode,
 		}
 	}
 
+	/* Control code for toggling the card state in SAM slot */
+	if ((IOCTL_SMARTCARD_TOGGLE_CARD_STATE == dwControlCode)
+		|| (WINIOCTL_SMARTCARD_TOGGLE_CARD_STATE == dwControlCode))
+	{
+		if (ccid_descriptor->isSamSlot)
+		{
+			if (TxLength > 0)
+			{
+				if (TxBuffer[0] == 0)
+				{
+					UCHAR buffer[MAX_ATR_SIZE];
+					DWORD length = sizeof(buffer);
+
+					/* Power down the card. */
+					(void)IFDHPowerICC(Lun, IFD_POWER_DOWN, buffer, &length);
+					usleep(10 * 1000);
+
+					/* Set the card state to absent. */
+					ccid_descriptor->dwSlotStatus = IFD_ICC_NOT_PRESENT;
+				}
+				else
+				{
+					/* Set the card state to present. */
+					ccid_descriptor->dwSlotStatus = IFD_ICC_PRESENT;
+				}
+
+				/* Trigger the slot change. */
+				TriggerSlotChange(reader_index);
+			}
+
+			*pdwBytesReturned = 1;
+			if (RxLength < *pdwBytesReturned)
+			{
+				return_value = IFD_ERROR_INSUFFICIENT_BUFFER;
+			}
+			else
+			{
+				/* Return the current state. */
+				RxBuffer[0] =
+					(ccid_descriptor->dwSlotStatus == IFD_ICC_PRESENT) ? 1 : 0;
+				return_value = IFD_SUCCESS;
+			}
+		}
+	}
+
 err:
 	if (IFD_SUCCESS != return_value)
 		*pdwBytesReturned = 0;
@@ -2658,6 +2728,15 @@ EXTERNAL RESPONSECODE IFDHICCPresence(DWORD Lun)
 	DEBUG_PERIODIC3("%s (lun: " DWORD_X ")", CcidSlots[reader_index].readerName, Lun);
 
 	ccid_descriptor = get_ccid_descriptor(reader_index);
+
+#ifdef __APPLE__
+	/* Return no card if the last slot was not opened. */
+	if (!*(ccid_descriptor->pLastSlotOpened))
+	{
+		return_value = IFD_ICC_NOT_PRESENT;
+		goto end;
+	}
+#endif
 
 	// Get slot index
 	slot_index = ccid_descriptor->bCurrentSlotIndex;
@@ -2977,83 +3056,6 @@ void init_driver(void)
 
 	DebugInitialized = TRUE;
 } /* init_driver */
-
-
-void extra_egt(ATR_t *atr, _ccid_descriptor *ccid_desc, DWORD Protocol)
-{
-	/* This function use an EGT value for cards who comply with followings
-	 * criterias:
-	 * - TA1 > 11
-	 * - current EGT = 0x00 or 0xFF
-	 * - T=0 or (T=1 and CWI >= 2)
-	 *
-	 * Without this larger EGT some non ISO 7816-3 smart cards may not
-	 * communicate with the reader.
-	 *
-	 * This modification is harmless, the reader will just be less restrictive
-	 */
-
-	unsigned int card_baudrate;
-	unsigned int default_baudrate;
-	double f, d;
-
-	/* if TA1 not present */
-	if (! atr->ib[0][ATR_INTERFACE_BYTE_TA].present)
-		return;
-
-	(void)ATR_GetParameter(atr, ATR_PARAMETER_D, &d);
-	(void)ATR_GetParameter(atr, ATR_PARAMETER_F, &f);
-
-	/* may happen with non ISO cards */
-	if ((0 == f) || (0 == d))
-		return;
-
-	/* Baudrate = f x D/F */
-	card_baudrate = (unsigned int) (1000 * ccid_desc->dwDefaultClock * d / f);
-
-	default_baudrate = (unsigned int) (1000 * ccid_desc->dwDefaultClock
-		* ATR_DEFAULT_D / ATR_DEFAULT_F);
-
-	/* TA1 > 11? */
-	if (card_baudrate <= default_baudrate)
-		return;
-
-	/* Current EGT = 0 or FF? */
-	if (atr->ib[0][ATR_INTERFACE_BYTE_TC].present &&
-		((0x00 == atr->ib[0][ATR_INTERFACE_BYTE_TC].value) ||
-		(0xFF == atr->ib[0][ATR_INTERFACE_BYTE_TC].value)))
-	{
-		if (SCARD_PROTOCOL_T0 == Protocol)
-		{
-			/* Init TC1 */
-			atr->ib[0][ATR_INTERFACE_BYTE_TC].present = TRUE;
-			atr->ib[0][ATR_INTERFACE_BYTE_TC].value = 2;
-			DEBUG_INFO1("Extra EGT patch applied");
-		}
-
-		if (SCARD_PROTOCOL_T1 == Protocol)
-		{
-			int i;
-
-			/* TBi (i>2) present? BWI/CWI */
-			for (i=2; i<ATR_MAX_PROTOCOLS; i++)
-			{
-				/* CWI >= 2 ? */
-				if (atr->ib[i][ATR_INTERFACE_BYTE_TB].present &&
-					((atr->ib[i][ATR_INTERFACE_BYTE_TB].value & 0x0F) >= 2))
-				{
-					/* Init TC1 */
-					atr->ib[0][ATR_INTERFACE_BYTE_TC].present = TRUE;
-					atr->ib[0][ATR_INTERFACE_BYTE_TC].value = 2;
-					DEBUG_INFO1("Extra EGT patch applied");
-
-					/* only the first TBi (i>2) must be used */
-					break;
-				}
-			}
-		}
-	}
-} /* extra_egt */
 
 
 static char find_baud_rate(unsigned int baudrate, unsigned int *list)
@@ -3685,6 +3687,7 @@ static RESPONSECODE process_spe_ppdu(unsigned int reader_index,
 		/* ACR83, APG8201 and APG8201Z. */
 		if ((ccid_descriptor->readerID == ACS_ACR83U)
 			|| (ccid_descriptor->readerID == ACS_APG8201)
+			|| (ccid_descriptor->readerID == ACS_APG8201_B2)
 			|| (ccid_descriptor->readerID == ACS_APG8201Z)
 			|| (ccid_descriptor->readerID == ACS_APG8201Z2))
 		{

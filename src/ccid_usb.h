@@ -1,6 +1,7 @@
 /*
     ccid_usb.h:  USB access routines using the libusb library
     Copyright (C) 2003-2010   Ludovic Rousseau
+    Copyright (C) 2018        Advanced Card Systems Ltd.
 
     This library is free software; you can redistribute it and/or
     modify it under the terms of the GNU Lesser General Public
@@ -42,4 +43,6 @@ int ControlUSB(int reader_index, int requesttype, int request, int value,
 
 int InterruptRead(int reader_index, int timeout);
 void InterruptStop(int reader_index);
+
+void TriggerSlotChange(int reader_index);
 #endif

@@ -2,7 +2,7 @@
     commands.c: Commands sent to the card
     Copyright (C) 2003-2010   Ludovic Rousseau
     Copyright (C) 2005 Martin Paljak
-    Copyright (C) 2010-2015   Advanced Card Systems Ltd.
+    Copyright (C) 2010-2018   Advanced Card Systems Ltd.
 
     This library is free software; you can redistribute it and/or
     modify it under the terms of the GNU Lesser General Public
@@ -73,6 +73,10 @@
 		return IFD_COMMUNICATION_ERROR;
 
 /* internal functions */
+static RESPONSECODE CmdXfrBlockAPDU_short(unsigned int reader_index,
+	unsigned int tx_length, unsigned char tx_buffer[], unsigned int *rx_length,
+	unsigned char rx_buffer[]);
+
 static RESPONSECODE CmdXfrBlockAPDU_extended(unsigned int reader_index,
 	unsigned int tx_length, unsigned char tx_buffer[], unsigned int *rx_length,
 	unsigned char rx_buffer[]);
@@ -1341,7 +1345,7 @@ RESPONSECODE CmdXfrBlock(unsigned int reader_index, unsigned int tx_length,
 
 		case CCID_CLASS_SHORT_APDU:
 			ccid_descriptor -> readTimeout = 0;	// Infinite
-			return_value = CmdXfrBlockTPDU_T0(reader_index,
+			return_value = CmdXfrBlockAPDU_short(reader_index,
 				tx_length, tx_buffer, rx_length, rx_buffer);
 			break;
 
@@ -1607,12 +1611,21 @@ time_request:
 			case 0xFF:	// Abort
 				// ACR83U, ACR85 and APG8201
 				// Invalid parameter in PIN verification/modification data structure
-				if (*rx_length < 2)
-					return IFD_ERROR_INSUFFICIENT_BUFFER;
-				rx_buffer[0]= 0x6B;
-				rx_buffer[1]= 0x80;
-				*rx_length = 2;
-				return IFD_SUCCESS;
+				if ((ACS_ACR83U == ccid_descriptor->readerID)
+					|| (ACS_ACR85_PINPAD_READER_ICC == ccid_descriptor->readerID)
+					|| (ACS_APG8201 == ccid_descriptor->readerID)
+					|| (ACS_APG8201_B2 == ccid_descriptor->readerID)
+					|| (ACS_APG8201Z == ccid_descriptor->readerID)
+					|| (ACS_APG8201Z2 == ccid_descriptor->readerID))
+				{
+					if (*rx_length < 2)
+						return IFD_ERROR_INSUFFICIENT_BUFFER;
+					rx_buffer[0]= 0x6B;
+					rx_buffer[1]= 0x80;
+					*rx_length = 2;
+					return IFD_SUCCESS;
+				}
+				return IFD_COMMUNICATION_ERROR;
 
 			case 0x84:	// Two "new PIN" entries do not match.
 				if (*rx_length < 2)
@@ -1692,6 +1705,55 @@ time_request:
 
 	return return_value;
 } /* CCID_Receive */
+
+
+/*****************************************************************************
+ *
+ *					CmdXfrBlockAPDU_short
+ *
+ ****************************************************************************/
+static RESPONSECODE CmdXfrBlockAPDU_short(unsigned int reader_index,
+	unsigned int tx_length, unsigned char tx_buffer[], unsigned int *rx_length,
+	unsigned char rx_buffer[])
+{
+	RESPONSECODE return_value = IFD_SUCCESS;
+	_ccid_descriptor *ccid_descriptor = get_ccid_descriptor(reader_index);
+
+	DEBUG_COMM2("T=0: %d bytes", tx_length);
+
+	/* command length too big for CCID reader? */
+	if (tx_length > ccid_descriptor->dwMaxCCIDMessageLength-10)
+	{
+#ifdef BOGUS_SCM_FIRMWARE_FOR_dwMaxCCIDMessageLength
+		if (263 == ccid_descriptor->dwMaxCCIDMessageLength)
+		{
+			DEBUG_INFO3("Command too long (%d bytes) for max: %d bytes."
+				" SCM reader with bogus firmware?",
+				tx_length, ccid_descriptor->dwMaxCCIDMessageLength-10);
+		}
+		else
+#endif
+		{
+			DEBUG_CRITICAL3("Command too long (%d bytes) for max: %d bytes",
+				tx_length, ccid_descriptor->dwMaxCCIDMessageLength-10);
+			return IFD_COMMUNICATION_ERROR;
+		}
+	}
+
+	/* command length too big for CCID driver? */
+	if (tx_length > CMD_BUF_SIZE)
+	{
+		DEBUG_CRITICAL3("Command too long (%d bytes) for max: %d bytes",
+				tx_length, CMD_BUF_SIZE);
+		return IFD_COMMUNICATION_ERROR;
+	}
+
+	return_value = CCID_Transmit(reader_index, tx_length, tx_buffer, 0, 0);
+	if (return_value != IFD_SUCCESS)
+		return return_value;
+
+	return CCID_Receive(reader_index, rx_length, rx_buffer, NULL);
+} /* CmdXfrBlockAPDU_short */
 
 
 /*****************************************************************************
@@ -1850,6 +1912,7 @@ static RESPONSECODE CmdXfrBlockTPDU_T0(unsigned int reader_index,
 {
 	RESPONSECODE return_value = IFD_SUCCESS;
 	_ccid_descriptor *ccid_descriptor = get_ccid_descriptor(reader_index);
+	unsigned char *tmpBuffer = NULL;
 
 	DEBUG_COMM2("T=0: %d bytes", tx_length);
 
@@ -1880,7 +1943,51 @@ static RESPONSECODE CmdXfrBlockTPDU_T0(unsigned int reader_index,
 		return IFD_COMMUNICATION_ERROR;
 	}
 
+	/* Convert APDU to TPDU. */
+	if (tx_length > 5)
+	{
+		unsigned int dataLength = tx_length - 5;
+		unsigned char Lc = tx_buffer[4];
+
+		if (Lc > 0)
+		{
+			/* Remove Le field if data length is longer than Lc. */
+			if (dataLength > Lc)
+			{
+				tx_length = 5 + Lc;
+			}
+			/* Append trailing zeros if data length is shorter than Lc. */
+			else if (dataLength < Lc)
+			{
+				unsigned int tmpBufferLength = 5 + Lc;
+
+				/* Allocate the buffer. */
+				tmpBuffer = (unsigned char *) malloc(tmpBufferLength);
+				if (tmpBuffer == NULL)
+				{
+					DEBUG_CRITICAL("Not enough memory");
+					return IFD_COMMUNICATION_ERROR;
+				}
+				else
+				{
+					memset(tmpBuffer, 0, tmpBufferLength);
+					memcpy(tmpBuffer, tx_buffer, tx_length);
+					tx_buffer = tmpBuffer;
+					tx_length = tmpBufferLength;
+				}
+			}
+		}
+	}
+
 	return_value = CCID_Transmit(reader_index, tx_length, tx_buffer, 0, 0);
+
+	/* Free the buffer. */
+	if (tmpBuffer != NULL)
+	{
+		free(tmpBuffer);
+		tmpBuffer = NULL;
+	}
+
 	if (return_value != IFD_SUCCESS)
 		return return_value;
 

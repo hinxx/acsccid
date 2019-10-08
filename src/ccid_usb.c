@@ -1,7 +1,7 @@
 /*
 	ccid_usb.c: USB access routines using the libusb library
 	Copyright (C) 2003-2010	Ludovic Rousseau
-	Copyright (C) 2009-2017	Advanced Card Systems Ltd.
+	Copyright (C) 2009-2019	Advanced Card Systems Ltd.
 
 	This library is free software; you can redistribute it and/or
 	modify it under the terms of the GNU Lesser General Public
@@ -109,6 +109,7 @@ typedef struct
 #ifdef __APPLE__
 	// Thread handle for card detection
 	pthread_t hThread;
+	int threadCreated;
 
 	// Flag to terminate thread
 	int terminated;
@@ -660,19 +661,14 @@ again:
 					 * So on Mac OS X the reader configuration is not done
 					 * by the OS/kernel and we do it ourself.
 					 */
-					if ((0xFF == desc.bDeviceClass)
-						&& (0xFF == desc.bDeviceSubClass)
-						&& (0xFF == desc.bDeviceProtocol))
+					r = libusb_set_configuration(dev_handle, 1);
+					if (r < 0)
 					{
-						r = libusb_set_configuration(dev_handle, 1);
-						if (r < 0)
-						{
-							(void)libusb_close(dev_handle);
-							DEBUG_CRITICAL4("Can't set configuration on %d/%d: %s",
-									bus_number, device_address,
-									libusb_error_name(r));
-							continue;
-						}
+						(void)libusb_close(dev_handle);
+						DEBUG_CRITICAL4("Can't set configuration on %d/%d: %s",
+								bus_number, device_address,
+								libusb_error_name(r));
+						continue;
 					}
 
 					/* recall */
@@ -693,6 +689,7 @@ again:
 				usb_interface = get_ccid_usb_interface(config_desc, &num);
 				if (usb_interface == NULL)
 				{
+					libusb_free_config_descriptor(config_desc);
 					(void)libusb_close(dev_handle);
 					if (0 == num)
 						DEBUG_CRITICAL3("Can't find a CCID interface on %d/%d",
@@ -715,6 +712,7 @@ again:
 						(readerID != ACS_ACR1281_1S_DUAL_READER) &&
 						(readerID != ACS_ACR1281_2S_CL_READER))
 					{
+						libusb_free_config_descriptor(config_desc);
 						(void)libusb_close(dev_handle);
 						DEBUG_CRITICAL3("Unable to find the device descriptor for %d/%d",
 							bus_number, device_address);
@@ -726,6 +724,7 @@ again:
 				interface = usb_interface->altsetting->bInterfaceNumber;
 				if (interface_number >= 0 && interface != interface_number)
 				{
+					libusb_free_config_descriptor(config_desc);
 					/* an interface was specified and it is not the
 					 * current one */
 					DEBUG_INFO3("Found interface %d but expecting %d",
@@ -742,6 +741,7 @@ again:
 				r = libusb_claim_interface(dev_handle, interface);
 				if (r < 0)
 				{
+					libusb_free_config_descriptor(config_desc);
 					(void)libusb_close(dev_handle);
 					DEBUG_CRITICAL4("Can't claim interface %d/%d: %s",
 						bus_number, device_address, libusb_error_name(r));
@@ -758,6 +758,7 @@ again:
 				/* check for firmware bugs */
 				if (ccid_check_firmware(&desc))
 				{
+					libusb_free_config_descriptor(config_desc);
 					(void)libusb_close(dev_handle);
 					return_value = STATUS_UNSUCCESSFUL;
 					goto end2;
@@ -976,6 +977,8 @@ again:
 #endif
 					usbDevice[reader_index].multislot_extension = NULL;
 
+				libusb_free_config_descriptor(config_desc);
+
 				// Get number of slots
 				numSlots = usbDevice[reader_index].ccid.bMaxSlotIndex + 1;
 
@@ -1036,7 +1039,10 @@ again:
 				usbDevice[reader_index].pTerminated = &usbDevice[reader_index].terminated;
 				usbDevice[reader_index].pTransfer = &usbDevice[reader_index].polling_transfer;
 				usbDevice[reader_index].pTransferLock = &usbDevice[reader_index].transferLock;
+				usbDevice[reader_index].threadCreated = FALSE;
 				usbDevice[reader_index].ccid.pbStatusLock = &usbDevice[reader_index].ccid.bStatusLock;
+				usbDevice[reader_index].ccid.lastSlotOpened = FALSE;
+				usbDevice[reader_index].ccid.pLastSlotOpened = &usbDevice[reader_index].ccid.lastSlotOpened;
 
 				// Create transfer lock
 				r = pthread_mutex_init(usbDevice[reader_index].pTransferLock, NULL);
@@ -1061,6 +1067,15 @@ again:
 					goto end2;
 				}
 
+				/* Disable card detection thread for APG8201 series. */
+				if ((usbDevice[reader_index].ccid.readerID == ACS_APG8201)
+					|| (usbDevice[reader_index].ccid.readerID == ACS_APG8201_B2)
+					|| (usbDevice[reader_index].ccid.readerID == ACS_APG8201Z)
+					|| (usbDevice[reader_index].ccid.readerID == ACS_APG8201Z2))
+				{
+					goto end;
+				}
+
 				// Create thread for card detection
 				r = pthread_create(&usbDevice[reader_index].hThread, NULL, CardDetectionThread, (void *) (intptr_t) reader_index);
 				if (r != 0)
@@ -1074,6 +1089,8 @@ again:
 					return_value = STATUS_UNSUCCESSFUL;
 					goto end2;
 				}
+
+				usbDevice[reader_index].threadCreated = TRUE;
 #endif
 				goto end;
 			}
@@ -1096,6 +1113,10 @@ end:
 			goto again_libusb;
 		}
 #endif
+
+		/* free bundle list */
+		bundleRelease(&plist);
+
 		/* failed */
 		close_libusb_if_needed();
 
@@ -1354,28 +1375,32 @@ status_t CloseUSB(unsigned int reader_index)
 		DEBUG_COMM("Last slot closed. Release resources");
 
 #ifdef __APPLE__
-		DEBUG_INFO3("Terminating thread: %d/%d",
-			usbDevice[reader_index].bus_number,
-			usbDevice[reader_index].device_address);
-
-		// Terminate thread
-		*usbDevice[reader_index].pTerminated = TRUE;
-
-		// Lock transfer
-		pthread_mutex_lock(usbDevice[reader_index].pTransferLock);
-
-		// Cancel transfer
-		if (*usbDevice[reader_index].pTransfer != NULL)
+		if (usbDevice[reader_index].threadCreated)
 		{
-			libusb_cancel_transfer(*usbDevice[reader_index].pTransfer);
-			*usbDevice[reader_index].pTransfer = NULL;
+			DEBUG_INFO3("Terminating thread: %d/%d",
+				usbDevice[reader_index].bus_number,
+				usbDevice[reader_index].device_address);
+
+			// Terminate thread
+			*usbDevice[reader_index].pTerminated = TRUE;
+
+			// Lock transfer
+			pthread_mutex_lock(usbDevice[reader_index].pTransferLock);
+
+			// Cancel transfer
+			if (*usbDevice[reader_index].pTransfer != NULL)
+			{
+				libusb_cancel_transfer(*usbDevice[reader_index].pTransfer);
+				*usbDevice[reader_index].pTransfer = NULL;
+			}
+
+			// Unlock transfer
+			pthread_mutex_unlock(usbDevice[reader_index].pTransferLock);
+
+			// Wait thread
+			pthread_join(usbDevice[reader_index].hThread, NULL);
+			usbDevice[reader_index].threadCreated = FALSE;
 		}
-
-		// Unlock transfer
-		pthread_mutex_unlock(usbDevice[reader_index].pTransferLock);
-
-		// Wait thread
-		pthread_join(usbDevice[reader_index].hThread, NULL);
 
 		// Free bStatus lock
 		pthread_mutex_destroy(usbDevice[reader_index].ccid.pbStatusLock);
@@ -1832,9 +1857,9 @@ int InterruptRead(int reader_index, int timeout /* in ms */)
 
 		default:
 			/* if libusb_interrupt_transfer() times out we get EILSEQ or EAGAIN */
-			DEBUG_COMM4("InterruptRead (%d/%d): %s",
+			DEBUG_COMM4("InterruptRead (%d/%d): %d",
 				usbDevice[reader_index].bus_number,
-				usbDevice[reader_index].device_address, libusb_error_name(ret));
+				usbDevice[reader_index].device_address, ret);
 			return_value = IFD_COMMUNICATION_ERROR;
 	}
 
@@ -1866,9 +1891,39 @@ void InterruptStop(int reader_index)
 
 		ret = libusb_cancel_transfer(transfer);
 		if (ret < 0)
-			DEBUG_CRITICAL2("libusb_cancel_transfer failed: %d", ret);
+			DEBUG_CRITICAL2("libusb_cancel_transfer failed: %s",
+				libusb_error_name(ret));
 	}
 } /* InterruptStop */
+
+
+/*****************************************************************************
+ *
+ *					TriggerSlotChange
+ *
+ ****************************************************************************/
+void TriggerSlotChange(int reader_index)
+{
+	struct usbDevice_MultiSlot_Extension *msExt =
+		usbDevice[reader_index].multislot_extension;
+
+	if (msExt != NULL)
+	{
+		int interrupt_byte =
+			(usbDevice[reader_index].ccid.bCurrentSlotIndex / 4) + 1;
+		int interrupt_value =
+			0x02 << (2 * (usbDevice[reader_index].ccid.bCurrentSlotIndex % 4));
+
+		pthread_mutex_lock(&msExt->mutex);
+
+		msExt->status = LIBUSB_TRANSFER_COMPLETED;
+		memset(msExt->buffer, 0, sizeof(msExt->buffer));
+		msExt->buffer[interrupt_byte] = interrupt_value;
+
+		pthread_cond_broadcast(&msExt->condition);
+		pthread_mutex_unlock(&msExt->mutex);
+	}
+}
 
 
 /*****************************************************************************
